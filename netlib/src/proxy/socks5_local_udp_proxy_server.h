@@ -35,7 +35,7 @@ namespace proxy
          * Alias for the negotiation context type defined by the proxy socket implementation (T).
          * Used to store authentication and session information for SOCKS5 negotiation.
          */
-        using negotiate_context_t = typename T::negotiate_context_t;
+        using negotiate_context_t = T::negotiate_context_t;
 
         /**
          * @brief Address type alias.
@@ -43,7 +43,7 @@ namespace proxy
          * Alias for the address type defined by the proxy socket implementation (T).
          * Represents an IPv4 or IPv6 address, depending on the template parameter.
          */
-        using address_type_t = typename T::address_type_t;
+        using address_type_t = T::address_type_t;
 
         /**
          * @brief Per-I/O context type alias.
@@ -51,7 +51,7 @@ namespace proxy
          * Alias for the per-I/O context type defined by the proxy socket implementation (T).
          * Used for managing asynchronous I/O operations.
          */
-        using per_io_context_t = typename T::per_io_context_t;
+        using per_io_context_t = T::per_io_context_t;
 
         /**
          * @brief Query remote peer function signature.
@@ -108,6 +108,14 @@ namespace proxy
          * Set to true when the server is stopping or has stopped.
          */
         std::atomic_bool end_server_{ true }; // set to true on proxy termination
+
+        /**
+         * @brief Counts the number of IOCP operations currently executing in the lambda.
+         *
+         * Incremented when entering the lambda, decremented when exiting.
+         * Used during shutdown to ensure no operations are in-flight before destroying the object.
+         */
+        std::atomic<int32_t> active_iocp_operations_{ 0 };
 
         /**
          * @brief UDP server socket handle.
@@ -184,8 +192,8 @@ namespace proxy
         socks5_local_udp_proxy_server(const uint16_t proxy_port, winsys::io_completion_port& completion_port,
             const std::function<query_remote_peer_t>& query_remote_peer_fn,
             const log_level log_level = log_level::error,
-            const std::shared_ptr<std::ostream>& log_stream = nullptr)
-            : logger(log_level, log_stream),
+            std::shared_ptr<std::ostream> log_stream = nullptr)
+            : logger(log_level, std::move(log_stream)),
             proxy_port_(proxy_port),
             completion_port_(completion_port),
             query_remote_peer_(query_remote_peer_fn)
@@ -262,9 +270,28 @@ namespace proxy
                     server_socket_,
                     [this](const DWORD num_bytes, OVERLAPPED* povlp, const BOOL status)
                     {
+                        // RAII guard to ensure we decrement on all exit paths (including exceptions)
+                        // Note: Counter was already incremented BEFORE the I/O operation was posted
+                        struct operation_guard {
+                            std::atomic<int32_t>& counter;
+                            
+                            explicit operation_guard(std::atomic<int32_t>& c) : counter(c) {}
+                            
+                            ~operation_guard() {
+                                counter.fetch_sub(1, std::memory_order_release);
+                            }
+                            
+                            // Delete copy and move to satisfy Rule of 5
+                            operation_guard(const operation_guard&) = delete;
+                            operation_guard(operation_guard&&) = delete;
+                            operation_guard& operator=(const operation_guard&) = delete;
+                            operation_guard& operator=(operation_guard&&) = delete;
+                        } guard{ active_iocp_operations_ };
+
                         auto result = true;
                         auto server_read = false;
 
+                        // Check if server is shutting down
                         if (end_server_)
                             return false;
 
@@ -334,26 +361,38 @@ namespace proxy
                         {
                             DWORD flags = 0;
 
-                            if ((::WSARecvFrom(
-                                server_socket_,
-                                &server_recv_buf_,
-                                1,
-                                nullptr,
-                                &flags,
-                                reinterpret_cast<sockaddr*>(&recv_from_sa_),
-                                &recv_from_sa_size_,
-                                &server_io_context_,
-                                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                            // Increment counter BEFORE posting the I/O operation
+                            // This ensures stop() will wait for this operation to complete
+                            if (!end_server_)
                             {
-                                result = false;
+                                active_iocp_operations_.fetch_add(1, std::memory_order_acquire);
+
+                                if ((::WSARecvFrom(
+                                    server_socket_,
+                                    &server_recv_buf_,
+                                    1,
+                                    nullptr,
+                                    &flags,
+                                    reinterpret_cast<sockaddr*>(&recv_from_sa_),
+                                    &recv_from_sa_size_,
+                                    &server_io_context_,
+                                    nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                                {
+                                    // Failed to post I/O, decrement counter
+                                    active_iocp_operations_.fetch_sub(1, std::memory_order_release);
+                                    result = false;
+                                }
                             }
                         }
 
                         return result;
-                    }); associate_status == true)
+                   }); associate_status == true)
                 {
                     completion_key_ = io_key;
                     DWORD flags = 0;
+
+                    // Increment counter BEFORE posting the initial I/O operation
+                    active_iocp_operations_.fetch_add(1, std::memory_order_acquire);
 
                     if ((::WSARecvFrom(
                         server_socket_,
@@ -365,9 +404,11 @@ namespace proxy
                         &recv_from_sa_size_,
                         &server_io_context_,
                         nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
-                    {
+                   {
+                        // Failed to post initial I/O, decrement counter
+                        active_iocp_operations_.fetch_sub(1, std::memory_order_release);
                         closesocket(server_socket_);
-                        end_server_ = false;
+                        end_server_ = true;
                         return false;
                     }
                 }
@@ -378,7 +419,7 @@ namespace proxy
                         closesocket(server_socket_);
                     }
 
-                    end_server_ = false;
+                    end_server_ = true;
                     return false;
                 }
             }
@@ -391,13 +432,15 @@ namespace proxy
         /**
          * @brief Stops the SOCKS5 local UDP proxy server and releases all resources.
          *
-         * This method signals the server to stop, joins any running threads,
-         * and clears all active proxy socket sessions. If the server is already stopped,
-         * the method returns immediately.
+         * This method performs a graceful shutdown by:
+         * 1. Setting the end_server_ flag to signal shutdown
+         * 2. Closing the server socket, which causes pending I/O to complete with error
+         * 3. Waiting for all active IOCP operations to complete (tracked by atomic counter)
+         * 4. Joining background threads
+         * 5. Clearing resources
          *
-         * - Sets the end_server_ flag to true to indicate shutdown.
-         * - Joins the proxy server and client cleanup threads if they are running.
-         * - Clears the proxy_sockets_ map, releasing all associated resources.
+         * The IOCP thread pool itself is managed by io_completion_port and will be 
+         * properly shut down when the completion port is destroyed.
          */
         void stop()
         {
@@ -407,8 +450,56 @@ namespace proxy
                 return;
             }
 
+            // Step 1: Signal shutdown - IOCP lambda will check this and exit
             end_server_ = true;
 
+            // Step 2: Close server socket
+            // This causes any pending WSARecvFrom to complete immediately with an error.
+            // When IOCP threads wake up, they'll see end_server_ == true and return false.
+            if (server_socket_ != static_cast<SOCKET>(INVALID_SOCKET))
+            {
+                closesocket(server_socket_);
+                server_socket_ = INVALID_SOCKET;
+            }
+
+            // Step 3: Close all proxy sockets FIRST to cancel their I/O operations
+            // This is CRITICAL: proxy sockets post their own I/O operations that will
+            // call back into this server's lambda, potentially after the server is destroyed.
+            // We must ensure all proxy socket I/O is cancelled before we proceed.
+            {
+                std::lock_guard lock(lock_);
+                if (!proxy_sockets_.empty())
+                {
+                    NETLIB_INFO("Closing {} proxy sockets before waiting for I/O completion", proxy_sockets_.size());
+                    // Closing the map entries will destroy the proxy sockets,
+                    // which will close their sockets and cancel any pending I/O
+                    proxy_sockets_.clear();
+                }
+            }
+
+            // Step 4: Wait for all active IOCP operations to complete
+            // The socket closure ensures pending operations complete quickly.
+            // The atomic counter ensures we wait until all in-flight operations finish.
+            // Use exponential backoff to avoid busy-waiting
+            using namespace std::chrono_literals;
+            int wait_iterations = 0;
+
+            while (active_iocp_operations_.load(std::memory_order_acquire) > 0)
+            {
+                if (constexpr int max_wait_iterations = 100; ++wait_iterations > max_wait_iterations)
+                {
+                    // Log warning if we're taking too long
+                    NETLIB_WARNING("Timeout waiting for IOCP operations to complete. Active operations: {}",
+                    active_iocp_operations_.load(std::memory_order_relaxed));
+                    break;
+                }
+             
+                // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 100ms
+                const auto wait_time = std::min(1ms * (1 << std::min(wait_iterations / 10, 6)), 100ms);
+                std::this_thread::sleep_for(wait_time);
+            }
+
+            // Step 5: Join background threads
             if (proxy_server_.joinable())
             {
                 proxy_server_.join();
@@ -417,11 +508,6 @@ namespace proxy
             if (check_clients_thread_.joinable())
             {
                 check_clients_thread_.join();
-            }
-
-            if (!proxy_sockets_.empty())
-            {
-                proxy_sockets_.clear();
             }
         }
 
@@ -500,7 +586,12 @@ namespace proxy
             }
             else
             {
-                sockaddr_in6 service{ address_type_t::af_type, htons(proxy_port_), 0, in6addr_any };
+                sockaddr_in6 service;
+                service.sin6_family = address_type_t::af_type;
+                service.sin6_port = htons(proxy_port_);
+                service.sin6_flowinfo = 0;
+                service.sin6_addr = in6addr_any;
+                service.sin6_scope_id = 0;
 
                 if (const auto status = bind(server_socket_, reinterpret_cast<SOCKADDR*>(&service), sizeof(service));
                     status == SOCKET_ERROR)
@@ -548,6 +639,21 @@ namespace proxy
             if (socks_tcp_socket == INVALID_SOCKET)
             {
                 return INVALID_SOCKET;
+            }
+
+            // Set socket timeouts to prevent indefinite blocking in recv/send calls
+            // This prevents deadlock where IOCP worker holds lock_ while blocked on network I/O
+            constexpr DWORD timeout_ms = 5000; // 5 second timeout
+            if (setsockopt(socks_tcp_socket, SOL_SOCKET, SO_RCVTIMEO, 
+                          reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms)) == SOCKET_ERROR)
+            {
+                NETLIB_WARNING("Failed to set socket receive timeout: {}", WSAGetLastError());
+            }
+            
+            if (setsockopt(socks_tcp_socket, SOL_SOCKET, SO_SNDTIMEO, 
+                          reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms)) == SOCKET_ERROR)
+            {
+                NETLIB_WARNING("Failed to set socket send timeout: {}", WSAGetLastError());
             }
 
             if constexpr (address_type_t::af_type == AF_INET)
@@ -651,7 +757,7 @@ namespace proxy
                 static_cast<int>(socks5_ident_req_size), 0);
             if (result == SOCKET_ERROR)
             {
-                NETLIB_LOG(log_level::info,
+                NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: Failed to send socks5_ident_req: {}",
                     WSAGetLastError());
                 return {};
@@ -660,7 +766,7 @@ namespace proxy
             result = recv(socks_tcp_socket, reinterpret_cast<char*>(&ident_resp), sizeof(ident_resp), 0);
             if (result == SOCKET_ERROR)
             {
-                NETLIB_LOG(log_level::info,
+                NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: Failed to receive socks5_ident_resp: {}",
                     WSAGetLastError());
                 return {};
@@ -669,7 +775,7 @@ namespace proxy
             if ((ident_resp.version != 5) ||
                 (ident_resp.method == 0xFF))
             {
-                NETLIB_LOG(log_level::info,
+                NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: SOCKS5 authentication has failed");
                 return {};
             }
@@ -678,43 +784,45 @@ namespace proxy
             {
                 if (!negotiate_ctx->socks5_username.has_value())
                 {
-                    NETLIB_LOG(log_level::info,
+                    NETLIB_INFO(
                         "[SOCKS5]: associate_to_socks5_proxy: RFC 1928: X'02' USERNAME/PASSWORD is chosen but USERNAME is not provided");
                     return {};
                 }
 
-                if (negotiate_ctx->socks5_username.value().length() > socks5_username_max_length || negotiate_ctx->
-                    socks5_username.value().length() < 1)
+                if (negotiate_ctx->socks5_username.value().length() > socks5_username_max_length || 
+                    negotiate_ctx->socks5_username.value().length() < 1)
                 {
-                    NETLIB_LOG(log_level::info,
+                    NETLIB_INFO(
                         "[SOCKS5]: associate_to_socks5_proxy: RFC 1928: X'02' USERNAME/PASSWORD is chosen but USERNAME exceeds maximum possible length");
                     return {};
                 }
 
                 if (!negotiate_ctx->socks5_password.has_value())
                 {
-                    NETLIB_LOG(log_level::info,
+                    NETLIB_INFO(
                         "[SOCKS5]: associate_to_socks5_proxy: RFC 1928: X'02' USERNAME/PASSWORD is chosen but PASSWORD is not provided");
                     return {};
                 }
 
-                if (negotiate_ctx->socks5_password.value().length() > socks5_username_max_length || negotiate_ctx->
-                    socks5_password.value().length() < 1)
+                if (negotiate_ctx->socks5_password.value().length() > socks5_username_max_length || 
+                    negotiate_ctx->socks5_password.value().length() < 1)
                 {
-                    NETLIB_LOG(log_level::info,
+                    NETLIB_INFO(
                         "[SOCKS5]: associate_to_socks5_proxy: RFC 1928: X'02' USERNAME/PASSWORD is chosen but PASSWORD exceeds maximum possible length");
                     return {};
                 }
 
-                const socks5_username_auth auth_req(negotiate_ctx->socks5_username.value(),
-                    negotiate_ctx->socks5_password.value());
+                const socks5_username_auth auth_req(
+                    negotiate_ctx->socks5_username.value(),
+                    negotiate_ctx->socks5_password.value()
+                );
 
                 result = send(socks_tcp_socket, reinterpret_cast<const char*>(&auth_req),
-                    3 + static_cast<int>(negotiate_ctx->socks5_username.value().length()) + static_cast<int>(
-                        negotiate_ctx->socks5_password.value().length()), 0);
+                    3 + static_cast<int>(negotiate_ctx->socks5_username.value().length()) + 
+                    static_cast<int>(negotiate_ctx->socks5_password.value().length()), 0);
                 if (result == SOCKET_ERROR)
                 {
-                    NETLIB_LOG(log_level::info,
+                    NETLIB_INFO(
                         "[SOCKS5]: associate_to_socks5_proxy: Failed to send socks5_username_auth: {}",
                         WSAGetLastError());
                     return {};
@@ -723,7 +831,7 @@ namespace proxy
                 result = recv(socks_tcp_socket, reinterpret_cast<char*>(&ident_resp), sizeof(ident_resp), 0);
                 if (result == SOCKET_ERROR)
                 {
-                    NETLIB_LOG(log_level::info,
+                    NETLIB_INFO(
                         "[SOCKS5]: associate_to_socks5_proxy: Failed to receive socks5_ident_resp: {}",
                         WSAGetLastError());
                     return {};
@@ -731,12 +839,12 @@ namespace proxy
 
                 if (ident_resp.method != 0x0)
                 {
-                    NETLIB_LOG(log_level::info,
+                    NETLIB_INFO(
                         "[SOCKS5]: associate_to_socks5_proxy: USERNAME/PASSWORD authentication has failed!");
                     return {};
                 }
 
-                NETLIB_LOG(log_level::info,
+                NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: USERNAME/PASSWORD authentication SUCCESS");
             }
 
@@ -756,7 +864,7 @@ namespace proxy
             result = send(socks_tcp_socket, reinterpret_cast<const char*>(&associate_req), sizeof(associate_req), 0);
             if (result == SOCKET_ERROR)
             {
-                NETLIB_LOG(log_level::info,
+                NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: Failed to send SOCKS5 ASSOCIATE request: {}",
                     WSAGetLastError());
                 return {};
@@ -765,7 +873,7 @@ namespace proxy
             result = recv(socks_tcp_socket, reinterpret_cast<char*>(&associate_resp), sizeof(associate_resp), 0);
             if (result == SOCKET_ERROR)
             {
-                NETLIB_LOG(log_level::info,
+                NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: Failed to receive SOCKS5 ASSOCIATE response: {}",
                     WSAGetLastError());
                 return {};
@@ -774,12 +882,12 @@ namespace proxy
             if ((associate_resp.version != 5) ||
                 (associate_resp.reply != 0))
             {
-                NETLIB_LOG(log_level::info,
+                NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: SOCKS5 ASSOCIATE has failed");
                 return {};
             }
 
-            NETLIB_LOG(log_level::info,
+            NETLIB_INFO(
                 "[SOCKS5]: associate_to_socks5_proxy: SOCKS5 ASSOCIATE SUCCESS port: {}",
                 ntohs(associate_resp.bind_port));
 
@@ -835,7 +943,7 @@ namespace proxy
             auto [remote_address, remote_port, negotiate_ctx] =
                 get_remote_peer(local_peer_address, local_peer_port);
 
-            NETLIB_LOG(log_level::debug,
+            NETLIB_DEBUG(
                 "connect_to_remote_host: Connect to SOCKS5 proxy and send ASSOCIATE command: {}:{}",
                 remote_address,
                 remote_port);
@@ -843,7 +951,7 @@ namespace proxy
             auto socks5_tcp_socket = connect_to_socks5_proxy(remote_address, remote_port);
             if (socks5_tcp_socket == INVALID_SOCKET)
             {
-                NETLIB_LOG(log_level::debug,
+                NETLIB_DEBUG(
                     "connect_to_remote_host: Failed to connect to SOCKS5 proxy: {}:{}",
                     remote_address,
                     remote_port);
@@ -853,7 +961,7 @@ namespace proxy
             auto udp_port = associate_to_socks5_proxy(socks5_tcp_socket, negotiate_ctx);
             if (!udp_port.has_value())
             {
-                NETLIB_LOG(log_level::debug,
+                NETLIB_DEBUG(
                     "connect_to_remote_host: ASSOCIATE command has failed: {}:{}",
                     remote_address,
                     remote_port);
@@ -862,7 +970,7 @@ namespace proxy
                 return false;
             }
 
-            NETLIB_LOG(log_level::debug,
+            NETLIB_DEBUG(
                 "connect_to_remote_host: UDP connect: {}:{}",
                 remote_address,
                 udp_port.value());
@@ -872,7 +980,7 @@ namespace proxy
 
             if (remote_socket == INVALID_SOCKET)
             {
-                NETLIB_LOG(log_level::debug,
+                NETLIB_DEBUG(
                     "connect_to_remote_host: Failed to create UDP socket: {}",
                     WSAGetLastError());
                 return false;
@@ -890,7 +998,7 @@ namespace proxy
                 {
                     closesocket(remote_socket);
                     closesocket(socks5_tcp_socket);
-                    NETLIB_LOG(log_level::debug,
+                    NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to bind UDP socket: {}",
                         WSAGetLastError());
                     return false;
@@ -908,7 +1016,7 @@ namespace proxy
                 {
                     closesocket(remote_socket);
                     closesocket(socks5_tcp_socket);
-                    NETLIB_LOG(log_level::debug,
+                    NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to bind UDP socket: {}",
                         WSAGetLastError());
                     return false;
@@ -928,7 +1036,7 @@ namespace proxy
                 {
                     closesocket(remote_socket);
                     closesocket(socks5_tcp_socket);
-                    NETLIB_LOG(log_level::debug,
+                    NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to connect UDP socket: {}",
                         WSAGetLastError());
                     return false;
@@ -946,7 +1054,7 @@ namespace proxy
                 {
                     closesocket(remote_socket);
                     closesocket(socks5_tcp_socket);
-                    NETLIB_LOG(log_level::debug,
+                    NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to connect UDP socket: {}",
                         WSAGetLastError());
                     return false;
@@ -970,7 +1078,7 @@ namespace proxy
             {
                 closesocket(remote_socket);
                 closesocket(socks5_tcp_socket);
-                NETLIB_LOG(log_level::debug,
+                NETLIB_DEBUG(
                     "connect_to_remote_host: Failed to create proxy socket for: {}:{}",
                     remote_address,
                     udp_port.value());

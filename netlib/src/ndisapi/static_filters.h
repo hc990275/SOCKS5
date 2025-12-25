@@ -295,8 +295,8 @@ namespace ndisapi
             const bool filter_cache,
             const bool fragment_cache,
             const log_level log_level = log_level::error,
-            const std::shared_ptr<std::ostream>& log_stream = nullptr)
-            : logger(log_level, log_stream)
+            std::shared_ptr<std::ostream> log_stream = nullptr)
+            : logger(log_level, std::move(log_stream))
         {
             using namespace std::string_literals;
 
@@ -482,7 +482,7 @@ namespace ndisapi
                             const bool success = RemoveStaticFilter(static_cast<uint32_t>(position));
                             if (!success)
                             {
-                                NETLIB_LOG(log_level::error, "Failed to remove filter at position: {}", position);
+                                NETLIB_ERROR("Failed to remove filter at position: {}", position);
                             }
                             return success;
                         }
@@ -532,7 +532,7 @@ namespace ndisapi
             catch (const std::exception& e)
             {
                 using namespace std::string_literals;
-                NETLIB_LOG(log_level::error, "Exception occured in store_table: {}", e.what());
+                NETLIB_ERROR("Exception occured in store_table: {}", e.what());
                 return false;
             }
         }

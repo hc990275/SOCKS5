@@ -65,17 +65,17 @@ namespace proxy
          * This type holds information required for session negotiation, such as credentials or
          * target addresses, and is defined by the proxy socket type T.
          */
-        using negotiate_context_t = typename T::negotiate_context_t;
+        using negotiate_context_t = T::negotiate_context_t;
 
         /**
          * @brief Type alias for the address type (e.g., IPv4 or IPv6) used by the proxy socket.
          */
-        using address_type_t = typename T::address_type_t;
+        using address_type_t = T::address_type_t;
 
         /**
          * @brief Type alias for the per-I/O context type used for managing asynchronous operations.
          */
-        using per_io_context_t = typename T::per_io_context_t;
+        using per_io_context_t = T::per_io_context_t;
 
         /**
          * @brief Type alias for the callback function used to query remote peer information.
@@ -158,6 +158,14 @@ namespace proxy
         std::atomic_bool end_server_{ true };
 
         /**
+         * @brief Counts the number of IOCP operations currently executing in the lambda.
+         *
+         * Incremented when entering the lambda, decremented when exiting.
+         * Used during shutdown to ensure no operations are in-flight before destroying the object.
+         */
+        std::atomic<int32_t> active_iocp_operations_{ 0 };
+
+        /**
          * @brief The main listening socket for incoming client connections.
          */
         SOCKET server_socket_{ INVALID_SOCKET };
@@ -188,8 +196,8 @@ namespace proxy
         tcp_proxy_server(const uint16_t proxy_port, winsys::io_completion_port& completion_port,
             const std::function<query_remote_peer_t>& query_remote_peer_fn,
             const log_level log_level = log_level::error,
-            const std::shared_ptr<std::ostream>& log_stream = nullptr)
-            : logger(log_level, log_stream),
+            std::shared_ptr<std::ostream> log_stream = nullptr)
+            : logger(log_level, std::move(log_stream)),
             proxy_port_(proxy_port),
             completion_port_(completion_port),
             query_remote_peer_(query_remote_peer_fn)
@@ -285,6 +293,28 @@ namespace proxy
                     std::get<1>(sock_array_events_[0]),
                     [this](const DWORD num_bytes, OVERLAPPED* povlp, const BOOL status)
                     {
+                        // Increment active operations counter on entry
+                        active_iocp_operations_.fetch_add(1, std::memory_order_acquire);
+                        
+                        // RAII guard to ensure we decrement on all exit paths (including exceptions)
+                        // Non-copyable/non-moveable to prevent double-decrement bugs
+                        struct operation_guard {
+                            std::atomic<int32_t>& counter;
+                            
+                            explicit operation_guard(std::atomic<int32_t>& c) : counter(c) {}
+                            
+                            ~operation_guard() {
+                                counter.fetch_sub(1, std::memory_order_release);
+                            }
+                            
+                            // Delete copy and move to satisfy Rule of 5
+                            operation_guard(const operation_guard&) = delete;
+                            operation_guard(operation_guard&&) = delete;
+                            operation_guard& operator=(const operation_guard&) = delete;
+                            operation_guard& operator=(operation_guard&&) = delete;
+                        } guard{ active_iocp_operations_ };
+
+                        // Check if server is shutting down
                         if (end_server_)
                             return false;
 
@@ -365,12 +395,15 @@ namespace proxy
         /**
          * @brief Stops the TCP proxy server and cleans up all resources.
          *
-         * This method performs a graceful shutdown of the proxy server. It:
-         * - Sets the end_server_ flag to true to signal all worker threads to terminate.
-         * - Closes the main listening socket and marks it as invalid.
-         * - Signals the event associated with the first socket array entry to wake up any waiting threads.
-         * - Joins (waits for) the proxy server, client cleanup, and remote host connection threads if they are running.
-         * - Clears the arrays of socket events and active proxy sockets to release all associated resources.
+         * This method performs a graceful shutdown of the proxy server by:
+         * 1. Setting the end_server_ flag to signal shutdown
+         * 2. Closing the server socket, which causes pending I/O to complete with error
+         * 3. Waiting for all active IOCP operations to complete (tracked by atomic counter)
+         * 4. Joining background threads
+         * 5. Clearing resources
+         *
+         * The IOCP thread pool itself is managed by io_completion_port and will be 
+         * properly shut down when the completion port is destroyed.
          *
          * If the server is already stopped, this method returns immediately.
          */
@@ -382,8 +415,12 @@ namespace proxy
                 return;
             }
 
+            // Step 1: Signal shutdown - IOCP lambda will check this and exit
             end_server_ = true;
 
+            // Step 2: Close server socket
+            // This causes any pending accept/I/O operations to complete immediately with an error.
+            // When IOCP threads wake up, they'll see end_server_ == true and return false.
             closesocket(server_socket_);
             server_socket_ = INVALID_SOCKET;
 
@@ -392,6 +429,29 @@ namespace proxy
                 ::WSASetEvent(std::get<0>(sock_array_events_[0]));
             }
 
+            // Step 3: Wait for all active IOCP operations to complete
+            // The socket closure ensures pending operations complete quickly.
+            // The atomic counter ensures we wait until all in-flight operations finish.
+            // Use exponential backoff to avoid busy-waiting
+            using namespace std::chrono_literals;
+            int wait_iterations = 0;
+
+            while (active_iocp_operations_.load(std::memory_order_acquire) > 0)
+            {
+                if (constexpr int max_wait_iterations = 100; ++wait_iterations > max_wait_iterations)
+                {
+                    // Log warning if we're taking too long
+                    NETLIB_WARNING("Timeout waiting for IOCP operations to complete. Active operations: {}",
+                        active_iocp_operations_.load(std::memory_order_relaxed));
+                    break;
+                }
+                
+                // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 100ms
+                const auto wait_time = std::min(1ms * (1 << std::min(wait_iterations / 10, 6)), 100ms);
+                std::this_thread::sleep_for(wait_time);
+            }
+
+            // Step 4: Join background threads
             if (proxy_server_.joinable())
             {
                 proxy_server_.join();
@@ -407,6 +467,11 @@ namespace proxy
                 connect_to_remote_host_thread_.join();
             }
 
+            // Step 5: Clear resources
+            // Now safe because:
+            // - end_server_ is true, so IOCP lambda won't process new completions
+            // - Socket is closed, so no new I/O can be initiated
+            // - We waited for all active operations to complete
             if (!sock_array_events_.empty())
             {
                 sock_array_events_.clear();
@@ -416,6 +481,9 @@ namespace proxy
             {
                 proxy_sockets_.clear();
             }
+
+            // Note: The IOCP thread pool itself is managed by completion_port_ and will be
+            // properly shut down when io_completion_port's destructor is called.
         }
 
         /**
@@ -610,18 +678,18 @@ namespace proxy
 
             if (!remote_port)
             {
-                NETLIB_LOG(log_level::warning, "connect_to_remote_host: Invalid remote port (0) - rejecting connection");
+                NETLIB_WARNING("connect_to_remote_host: Invalid remote port (0) - rejecting connection");
                 return false;
             }
 
-            NETLIB_LOG(log_level::debug, "connect_to_remote_host: Connecting to {}:{}", remote_ip, remote_port);
+            NETLIB_DEBUG("connect_to_remote_host: Connecting to {}:{}", remote_ip, remote_port);
 
             auto remote_socket = WSASocket(address_type_t::af_type, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
                 WSA_FLAG_OVERLAPPED);
 
             if (remote_socket == INVALID_SOCKET)
             {
-                NETLIB_LOG(log_level::error, "connect_to_remote_host: Failed to create remote socket: {}", WSAGetLastError());
+                NETLIB_ERROR("connect_to_remote_host: Failed to create remote socket: {}", WSAGetLastError());
                 return false;
             }
 
@@ -638,7 +706,7 @@ namespace proxy
                 if (status == SOCKET_ERROR)
                 {
                     const auto error = WSAGetLastError();
-                    NETLIB_LOG(log_level::error, "connect_to_remote_host: Failed to bind IPv4 remote socket: {}", error);
+                    NETLIB_ERROR("connect_to_remote_host: Failed to bind IPv4 remote socket: {}", error);
                     shutdown(remote_socket, SD_BOTH);
                     closesocket(remote_socket);
                     return false;
@@ -657,7 +725,7 @@ namespace proxy
                 if (status == SOCKET_ERROR)
                 {
                     const auto error = WSAGetLastError();
-                    NETLIB_LOG(log_level::error, "connect_to_remote_host: Failed to bind IPv6 remote socket: {}", error);
+                    NETLIB_ERROR("connect_to_remote_host: Failed to bind IPv6 remote socket: {}", error);
                     shutdown(remote_socket, SD_BOTH);
                     closesocket(remote_socket);
                     return false;
@@ -670,7 +738,7 @@ namespace proxy
             if (ret != 0)
             {
                 const auto error = WSAGetLastError();
-                NETLIB_LOG(log_level::warning, "connect_to_remote_host: Failed to set non-blocking mode: {}", error);
+                NETLIB_WARNING("connect_to_remote_host: Failed to set non-blocking mode: {}", error);
                 // Continue anyway, as this might not be critical
             }
 
@@ -681,7 +749,7 @@ namespace proxy
 
                 if (sock_array_events_.size() >= connections_array_size - 1)
                 {
-                    NETLIB_LOG(log_level::warning, "connect_to_remote_host: Socket array full, cannot add new connection");
+                    NETLIB_WARNING("connect_to_remote_host: Socket array full, cannot add new connection");
                     shutdown(remote_socket, SD_BOTH);
                     closesocket(remote_socket);
                     return false;
@@ -692,7 +760,7 @@ namespace proxy
 
                 if (std::get<0>(sock_array_events_.back()) == WSA_INVALID_EVENT)
                 {
-                    NETLIB_LOG(log_level::error, "connect_to_remote_host: Failed to create WSA event: {}", WSAGetLastError());
+                    NETLIB_ERROR("connect_to_remote_host: Failed to create WSA event: {}", WSAGetLastError());
                     sock_array_events_.pop_back();
                     shutdown(remote_socket, SD_BOTH);
                     closesocket(remote_socket);
@@ -702,7 +770,7 @@ namespace proxy
                 if (WSAEventSelect(remote_socket, std::get<0>(sock_array_events_.back()), FD_CONNECT) == SOCKET_ERROR)
                 {
                     const auto error = WSAGetLastError();
-                    NETLIB_LOG(log_level::warning, "connect_to_remote_host: WSAEventSelect failed: {}", error);
+                    NETLIB_WARNING("connect_to_remote_host: WSAEventSelect failed: {}", error);
                     WSACloseEvent(std::get<0>(sock_array_events_.back()));
                     sock_array_events_.pop_back();
                     shutdown(remote_socket, SD_BOTH);
@@ -713,7 +781,7 @@ namespace proxy
                 WSASetEvent(std::get<0>(sock_array_events_[0]));
             }
 
-            NETLIB_LOG(log_level::debug, "connect_to_remote_host: Initiating connection to {}:{}", remote_ip, remote_port);
+            NETLIB_DEBUG("connect_to_remote_host: Initiating connection to {}:{}", remote_ip, remote_port);
 
             // connect to server
             if constexpr (address_type_t::af_type == AF_INET)
@@ -728,16 +796,16 @@ namespace proxy
                 {
                     if (const auto error = WSAGetLastError(); error != WSAEWOULDBLOCK)
                     {
-                        NETLIB_LOG(log_level::warning, "connect_to_remote_host: IPv4 connect failed: {}", error);
+                        NETLIB_WARNING("connect_to_remote_host: IPv4 connect failed: {}", error);
                         shutdown(remote_socket, SD_BOTH);
                         closesocket(remote_socket);
                         return false;
                     }
-                    NETLIB_LOG(log_level::debug, "connect_to_remote_host: IPv4 connection in progress (WSAEWOULDBLOCK)");
+                    NETLIB_DEBUG("connect_to_remote_host: IPv4 connection in progress (WSAEWOULDBLOCK)");
                 }
                 else
                 {
-                    NETLIB_LOG(log_level::debug, "connect_to_remote_host: IPv4 connection completed immediately");
+                    NETLIB_DEBUG("connect_to_remote_host: IPv4 connection completed immediately");
                 }
             }
             else
@@ -752,23 +820,23 @@ namespace proxy
                 {
                     if (const auto error = WSAGetLastError(); error != WSAEWOULDBLOCK)
                     {
-                        NETLIB_LOG(log_level::warning, "connect_to_remote_host: IPv6 connect failed: {}", error);
+                        NETLIB_WARNING("connect_to_remote_host: IPv6 connect failed: {}", error);
                         shutdown(remote_socket, SD_BOTH);
                         closesocket(remote_socket);
                         return false;
                     }
                     else
                     {
-                        NETLIB_LOG(log_level::debug, "connect_to_remote_host: IPv6 connection in progress (WSAEWOULDBLOCK)");
+                        NETLIB_DEBUG("connect_to_remote_host: IPv6 connection in progress (WSAEWOULDBLOCK)");
                     }
                 }
                 else
                 {
-                    NETLIB_LOG(log_level::debug, "connect_to_remote_host: IPv6 connection completed immediately");
+                    NETLIB_DEBUG("connect_to_remote_host: IPv6 connection completed immediately");
                 }
             }
 
-            NETLIB_LOG(log_level::debug, "connect_to_remote_host: Successfully initiated connection to {}:{}", remote_ip, remote_port);
+            NETLIB_DEBUG("connect_to_remote_host: Successfully initiated connection to {}:{}", remote_ip, remote_port);
             return true;
         }
 
@@ -798,7 +866,7 @@ namespace proxy
                 }
 
                 if (sock_array_events_.size() >= connections_array_size) {
-                    NETLIB_LOG(log_level::warning, "Too many pending connections, rejecting new client.");
+                    NETLIB_WARNING("Too many pending connections, rejecting new client.");
                     closesocket(accepted);
                     continue;
                 }
